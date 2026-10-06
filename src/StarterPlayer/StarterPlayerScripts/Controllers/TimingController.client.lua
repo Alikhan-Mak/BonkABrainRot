@@ -2,13 +2,17 @@ local Players = game:GetService("Players")
 local UserInputService = game:GetService("UserInputService")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local RunService = game:GetService("RunService")
-local Workspace = game:GetService("Workspace")
 
 local player = Players.LocalPlayer
 local playerGui = player:WaitForChild("PlayerGui")
 
-local Remotes = ReplicatedStorage:WaitForChild("Remotes", 10)
-local launchRemote = Remotes and Remotes:WaitForChild("LaunchRemote", 10)
+local Remotes = ReplicatedStorage:WaitForChild("Remotes")
+local timingRemote = Remotes:WaitForChild("StartTimingMeter")
+local hitRemote = Remotes:WaitForChild("ExecuteHit")
+local BAT_SWING_ANIMATION_ID = "rbxassetid://522635514"
+local swingAnimation = Instance.new("Animation")
+swingAnimation.AnimationId = BAT_SWING_ANIMATION_ID
+local swingTracks = setmetatable({}, { __mode = "k" })
 
 -- === UI ТАЙМИНГА ===
 local screenGui = Instance.new("ScreenGui")
@@ -73,10 +77,45 @@ local speed = 2.5
 local direction = 1
 local isRunning = false
 local isCooldown = false
-local isToolEquipped = false
+local timeRemaining = 0
+
+-- Функция вызова шкалы при подбрасывании BrainRot
+local function startTimingMeter(isActive: boolean, result: any)
+	if not isActive then
+		isRunning = false
+		isCooldown = false
+		player:SetAttribute("BonkTimingActive", false)
+		meterFrame.Visible = false
+		if result == "timeout" then
+			statusLabel.Text = "ВРЕМЯ ВЫШЛО"
+		end
+		return
+	end
+
+	if isCooldown then
+		return
+	end
+
+	player:SetAttribute("BonkTimingActive", true)
+	meterValue = 0
+	direction = 1
+	isRunning = true
+	timeRemaining = if typeof(result) == "number" then result else 10
+	meterFrame.Visible = true
+	statusLabel.Text = "КЛИКНИ ДЛЯ УДАРА!"
+	statusLabel.TextColor3 = Color3.fromRGB(255, 255, 255)
+end
+
+timingRemote.OnClientEvent:Connect(startTimingMeter)
 
 RunService.RenderStepped:Connect(function(dt)
-	if not isRunning or not isToolEquipped or isCooldown then return end
+	if not isRunning or isCooldown then return end
+	timeRemaining = math.max(0, timeRemaining - dt)
+	statusLabel.Text = string.format("КЛИКНИ ДЛЯ УДАРА! %d", math.ceil(timeRemaining))
+	if timeRemaining <= 0 then
+		isRunning = false
+		return
+	end
 	
 	meterValue = meterValue + (dt * speed * direction)
 	if meterValue >= 1 then meterValue = 1; direction = -1 end
@@ -85,6 +124,9 @@ RunService.RenderStepped:Connect(function(dt)
 end)
 
 local function calculateMultiplier(val)
+	if val <= 0.04 or val >= 0.96 then
+		return 1, "EDGE HIT: 1X", Color3.fromRGB(255, 255, 255)
+	end
 	if val >= 0.90 then
 		return 3.5, "PERFECT BONK!", Color3.fromRGB(180, 50, 255)
 	elseif val >= 0.70 then
@@ -96,41 +138,37 @@ local function calculateMultiplier(val)
 	end
 end
 
-local function checkEquippedTool()
+local function playBatSwing()
 	local character = player.Character
-	if not character then 
-		isToolEquipped = false
-		meterFrame.Visible = false
-		isRunning = false
-		return 
-	end
-	
-	local currentTool = character:FindFirstChildOfClass("Tool")
-	if currentTool then
-		if not isToolEquipped then
-			isToolEquipped = true
-			meterFrame.Visible = true
-			if not isCooldown then
-				isRunning = true
-				meterValue = 0
-				direction = 1
-				statusLabel.Text = "КЛИКНИ ДЛЯ УДАРА!"
-				statusLabel.TextColor3 = Color3.fromRGB(255, 255, 255)
-			end
-		end
-	else
-		isToolEquipped = false
-		meterFrame.Visible = false
-		isRunning = false
-	end
-end
+	local humanoid = character and character:FindFirstChildOfClass("Humanoid")
+	if not humanoid then return end
 
-RunService.Heartbeat:Connect(checkEquippedTool)
+	local animator = humanoid:FindFirstChildOfClass("Animator")
+	if not animator then
+		animator = Instance.new("Animator")
+		animator.Parent = humanoid
+	end
+
+	local track = swingTracks[animator]
+	if not track then
+		local success, loadedTrack = pcall(function()
+			return animator:LoadAnimation(swingAnimation)
+		end)
+		if not success then return end
+		track = loadedTrack
+		track.Priority = Enum.AnimationPriority.Action
+		swingTracks[animator] = track
+	end
+
+	track:Play(0.05, 1, 1)
+end
 
 local function onCharacterAdded(char)
 	isCooldown = false
 	isRunning = false
 	meterValue = 0
+	player:SetAttribute("BonkTimingActive", false)
+	meterFrame.Visible = false
 end
 
 if player.Character then onCharacterAdded(player.Character) end
@@ -138,116 +176,18 @@ player.CharacterAdded:Connect(onCharacterAdded)
 
 -- === ОБРАБОТКА КЛИКА ===
 UserInputService.InputBegan:Connect(function(input, gpe)
-	-- ЗАПОР КЛИКОВ В ПОЛЁТЕ
-	if gpe or isCooldown or not isToolEquipped or not isRunning then return end
-	
-	if input.UserInputType == Enum.UserInputType.MouseButton1 
-		or input.UserInputType == Enum.UserInputType.Touch
-		or input.KeyCode == Enum.KeyCode.Space then
+	if gpe or isCooldown or not isRunning then return end
+	if input.KeyCode == Enum.KeyCode.E
+		or input.UserInputType == Enum.UserInputType.MouseButton1
+		or input.UserInputType == Enum.UserInputType.Touch then
 		
-		-- Блокируем повторный ввод
 		isCooldown = true
 		isRunning = false
 		
 		local mult, text, color = calculateMultiplier(meterValue)
 		statusLabel.Text = text
 		statusLabel.TextColor3 = color
-		
-		if launchRemote then
-			launchRemote:FireServer(mult)
-		end
-		
-		task.delay(0.2, function()
-			if isCooldown and isToolEquipped then
-				statusLabel.Text = "В ПОЛЁТЕ..."
-				statusLabel.TextColor3 = Color3.fromRGB(200, 200, 255)
-			end
-		end)
+		playBatSwing()
+		hitRemote:FireServer(mult)
 	end
 end)
-
--- === ОБРАБОТКА ПОЛЁТА И ПРИЗЕМЛЕНИЯ ===
-if launchRemote then
-	launchRemote.OnClientEvent:Connect(function(targetHrp: BasePart, launchVelocity: Vector3)
-		if not targetHrp or not targetHrp:IsA("BasePart") then return end
-		
-		local targetModel = targetHrp.Parent
-		if not targetModel then return end
-		local humanoid = targetModel:FindFirstChildOfClass("Humanoid")
-		
-		if humanoid then
-			humanoid.Sit = false
-			humanoid.PlatformStand = false
-			humanoid:ChangeState(Enum.HumanoidStateType.Freefall)
-		end
-		
-		targetHrp.CFrame = targetHrp.CFrame + Vector3.new(0, 1.5, 0)
-		targetHrp.AssemblyLinearVelocity = launchVelocity
-		
-		local startTime = os.clock()
-		local finished = false
-		local flightConn
-		
-		local function finishFlight()
-			if finished then return end
-			finished = true
-			
-			if flightConn then flightConn:Disconnect(); flightConn = nil end
-			
-			if humanoid and humanoid.Parent and humanoid.Health > 0 then
-				humanoid.Sit = false
-				humanoid.PlatformStand = false
-				humanoid:ChangeState(Enum.HumanoidStateType.GettingUp)
-				task.defer(function()
-					if humanoid and humanoid.Parent then
-						humanoid:ChangeState(Enum.HumanoidStateType.Running)
-					end
-				end)
-			end
-			
-			-- Сигнал о приземлении
-			if launchRemote then
-				launchRemote:FireServer("Landed")
-			end
-			
-			-- Разблокировка только через 0.5с ПОСЛЕ ПРИЗЕМЛЕНИЯ
-			task.delay(0.5, function()
-				isCooldown = false
-				if isToolEquipped then
-					meterValue = 0
-					direction = 1
-					isRunning = true
-					statusLabel.Text = "КЛИКНИ ДЛЯ УДАРА!"
-					statusLabel.TextColor3 = Color3.fromRGB(255, 255, 255)
-				end
-			end)
-		end
-		
-		-- Отслеживание земли
-		flightConn = RunService.Heartbeat:Connect(function()
-			if not targetHrp or not targetHrp.Parent then
-				finishFlight()
-				return
-			end
-			
-			local timeInAir = os.clock() - startTime
-			
-			-- ВНИМАНИЕ: Проверка земли начинается ТОЛЬКО СПУСТЯ 1.2 СЕКУНДЫ В ПОЛЕТЕ!
-			if timeInAir > 1.2 then
-				local raycast = Workspace:Raycast(targetHrp.Position, Vector3.new(0, -4.5, 0))
-				local onFloor = humanoid and humanoid.FloorMaterial ~= Enum.Material.Air
-				local speedMagnitude = targetHrp.AssemblyLinearVelocity.Magnitude
-				
-				if raycast or onFloor or (timeInAir > 1.5 and speedMagnitude < 2) then
-					finishFlight()
-					return
-				end
-			end
-			
-			if timeInAir > 12 then
-				finishFlight()
-				return
-			end
-		end)
-	end)
-end
