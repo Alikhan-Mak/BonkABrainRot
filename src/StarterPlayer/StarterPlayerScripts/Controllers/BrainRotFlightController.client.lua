@@ -1,13 +1,15 @@
 local Players = game:GetService("Players")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local RunService = game:GetService("RunService")
-local UserInputService = game:GetService("UserInputService")
+local ContextActionService = game:GetService("ContextActionService")
 
 local player = Players.LocalPlayer
 local playerGui = player:WaitForChild("PlayerGui")
 local remotes = ReplicatedStorage:WaitForChild("Remotes")
 local flightRemote = remotes:WaitForChild("BrainRotFlight")
 local steerRemote = remotes:WaitForChild("SteerBrainRot")
+
+local STEER_ACTION = "BrainRotSteer"
 
 local rewardGui = Instance.new("ScreenGui")
 rewardGui.Name = "BrainRotFlightGui"
@@ -54,8 +56,48 @@ local function setCameraToCharacter()
 	end
 end
 
+-- A/D/Left/Right steer, S/Down/Space dive. Sinking these keys stops the character from
+-- walking/jumping around while the brainrot is in the air.
+local function onSteerAction(_, state: Enum.UserInputState, input: InputObject)
+	local pressed = state == Enum.UserInputState.Begin
+	local key = input.KeyCode
+	if key == Enum.KeyCode.A or key == Enum.KeyCode.Left then
+		steeringLeft = pressed
+	elseif key == Enum.KeyCode.D or key == Enum.KeyCode.Right then
+		steeringRight = pressed
+	elseif key == Enum.KeyCode.S or key == Enum.KeyCode.Down or key == Enum.KeyCode.Space then
+		diving = pressed
+	end
+	return Enum.ContextActionResult.Sink
+end
+
+local function bindSteering()
+	ContextActionService:BindActionAtPriority(
+		STEER_ACTION,
+		onSteerAction,
+		false,
+		Enum.ContextActionPriority.High.Value,
+		Enum.KeyCode.A,
+		Enum.KeyCode.D,
+		Enum.KeyCode.Left,
+		Enum.KeyCode.Right,
+		Enum.KeyCode.S,
+		Enum.KeyCode.Down,
+		Enum.KeyCode.Space
+	)
+end
+
+local function releaseFlight()
+	flyingPart = nil
+	steeringLeft = false
+	steeringRight = false
+	diving = false
+	ContextActionService:UnbindAction(STEER_ACTION)
+	player:SetAttribute("BrainRotFlying", false)
+	setCameraToCharacter()
+end
+
 local function startFlight(part: BasePart)
-	if not part:IsA("BasePart") then return end
 	flightToken += 1
 	flyingPart = part
 	steeringLeft = false
@@ -64,6 +106,8 @@ local function startFlight(part: BasePart)
 	previousSteer = 0
 	previousDive = false
 	rewardLabel.Visible = false
+	player:SetAttribute("BrainRotFlying", true)
+	bindSteering()
 
 	camera = workspace.CurrentCamera
 	if camera then
@@ -74,12 +118,8 @@ end
 
 local function endFlight(distance: number, coinsEarned: number)
 	flightToken += 1
-	flyingPart = nil
-	steeringLeft = false
-	steeringRight = false
-	diving = false
+	releaseFlight()
 	steerRemote:FireServer(0, false)
-	setCameraToCharacter()
 
 	rewardLabel.Text = string.format("%d studs  |  +%d coins", distance, coinsEarned)
 	rewardLabel.Visible = true
@@ -101,33 +141,12 @@ flightRemote.OnClientEvent:Connect(function(action: string, firstValue: any, sec
 	end
 end)
 
-local function setInput(input: InputObject, isPressed: boolean)
-	if input.KeyCode == Enum.KeyCode.A or input.KeyCode == Enum.KeyCode.Left then
-		steeringLeft = isPressed
-	elseif input.KeyCode == Enum.KeyCode.D or input.KeyCode == Enum.KeyCode.Right then
-		steeringRight = isPressed
-	elseif input.KeyCode == Enum.KeyCode.S
-		or input.KeyCode == Enum.KeyCode.Down
-		or input.KeyCode == Enum.KeyCode.Space then
-		diving = isPressed
-	end
-end
-
-UserInputService.InputBegan:Connect(function(input, gameProcessed)
-	if not flyingPart or gameProcessed then return end
-	setInput(input, true)
-end)
-
-UserInputService.InputEnded:Connect(function(input)
-	if not flyingPart then return end
-	setInput(input, false)
-end)
-
 RunService.RenderStepped:Connect(function()
-	if not flyingPart then return end
+	if not flyingPart then
+		return
+	end
 	if not flyingPart.Parent then
-		setCameraToCharacter()
-		flyingPart = nil
+		releaseFlight()
 		return
 	end
 

@@ -1,9 +1,12 @@
 local Players = game:GetService("Players")
 
-Players.PlayerAdded:Connect(function(player)
+local function setupPlayer(player: Player)
+	if player:FindFirstChild("leaderstats") then
+		return
+	end
+
 	local leaderstats = Instance.new("Folder")
 	leaderstats.Name = "leaderstats"
-	leaderstats.Parent = player
 
 	local coins = Instance.new("IntValue")
 	coins.Name = "Coins"
@@ -14,4 +17,12 @@ Players.PlayerAdded:Connect(function(player)
 	bestDistance.Name = "Best"
 	bestDistance.Value = 0
 	bestDistance.Parent = leaderstats
-end)
+
+	leaderstats.Parent = player -- parent last so the children are already there when it replicates
+end
+
+Players.PlayerAdded:Connect(setupPlayer)
+-- Studio: the player can already be in the game before this script runs
+for _, player in ipairs(Players:GetPlayers()) do
+	setupPlayer(player)
+end

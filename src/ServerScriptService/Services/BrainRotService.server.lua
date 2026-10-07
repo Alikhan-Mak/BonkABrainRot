@@ -3,6 +3,10 @@ local Workspace = game:GetService("Workspace")
 local Players = game:GetService("Players")
 local RunService = game:GetService("RunService")
 
+local Shared = ReplicatedStorage:WaitForChild("Shared")
+local Config = require(Shared:WaitForChild("Config"))
+local ZoneUtil = require(Shared:WaitForChild("ZoneUtil"))
+
 local remotesFolder = ReplicatedStorage:FindFirstChild("Remotes")
 if not remotesFolder then
 	remotesFolder = Instance.new("Folder")
@@ -26,22 +30,26 @@ local hitRemote = getRemoteEvent("ExecuteHit")
 local flightRemote = getRemoteEvent("BrainRotFlight")
 local steerRemote = getRemoteEvent("SteerBrainRot")
 
-local HIT_WINDOW_SECONDS = 10
-local BONK_ZONE_RADIUS = 15
 local activeSequences = {}
 local activeFlights = {}
+local lastFlightEndedAt = {}
+local lastSteerAt = {}
+local warnedNoZone = false
 
-print("[BrainRot] Service loaded; waiting for TriggerBonkSequence.")
-
-local function getBonkZoneDistance(position: Vector3): number?
-	local zonesFolder = Workspace:FindFirstChild("Zones")
-	local bonkZone = zonesFolder and zonesFolder:FindFirstChild("BonkZone")
-	if not bonkZone or not bonkZone:IsA("BasePart") then
-		warn("[BrainRot] Cannot start: Workspace.Zones.BonkZone is missing or is not a BasePart.")
-		return nil
+local function isInBonkZone(position: Vector3): boolean
+	local zone = ZoneUtil.find("BonkZone")
+	if not zone then
+		if Config.REQUIRE_BONK_ZONE then
+			warn("[BrainRot] No part named 'BonkZone' found in Workspace - launching is disabled.")
+			return false
+		end
+		if not warnedNoZone then
+			warnedNoZone = true
+			warn("[BrainRot] No part named 'BonkZone' found in Workspace - allowing launch anywhere (Config.REQUIRE_BONK_ZONE = false).")
+		end
+		return true
 	end
-
-	return (position - bonkZone.Position).Magnitude
+	return ZoneUtil.isInside(zone, position, Config.BONK_ZONE_MARGIN)
 end
 
 local function restoreCharacter(sequence)
@@ -59,7 +67,9 @@ local function restoreCharacter(sequence)
 end
 
 local function finishSequence(player: Player, sequence, reason: string, destroyBrainRot: boolean)
-	if activeSequences[player] ~= sequence then return end
+	if activeSequences[player] ~= sequence then
+		return
+	end
 	activeSequences[player] = nil
 	restoreCharacter(sequence)
 	if destroyBrainRot and sequence.brainRot.Parent then
@@ -69,13 +79,19 @@ local function finishSequence(player: Player, sequence, reason: string, destroyB
 end
 
 local function completeFlight(player: Player, flight)
-	if activeFlights[player] ~= flight then return end
+	if activeFlights[player] ~= flight then
+		return
+	end
 	activeFlights[player] = nil
+	lastFlightEndedAt[player] = os.clock()
 
 	local part = flight.brainRot
 	local finalPosition = if part.Parent then part.Position else flight.lastPosition
-	local distance = math.floor((finalPosition - flight.startPosition).Magnitude)
-	local coinsEarned = math.floor(distance * 1.5)
+	-- horizontal distance only: height should not count as "distance"
+	local offset = finalPosition - flight.startPosition
+	local distance = math.floor(Vector3.new(offset.X, 0, offset.Z).Magnitude)
+	local coinsEarned = math.floor(distance * Config.COINS_PER_STUD)
+
 	local leaderstats = player:FindFirstChild("leaderstats")
 	if leaderstats then
 		local coins = leaderstats:FindFirstChild("Coins")
@@ -98,43 +114,66 @@ local function completeFlight(player: Player, flight)
 	end
 end
 
-local function launchBrainRot(player: Player, sequence, multiplier: number, reason: string)
-	if activeSequences[player] ~= sequence then return end
+local function launchBrainRot(player: Player, sequence, zoneName: string, reason: string)
+	if activeSequences[player] ~= sequence then
+		return
+	end
 	local brainRot = sequence.brainRot
-	if not brainRot.Parent then
-		finishSequence(player, sequence, "cancelled", false)
+	if not brainRot.Parent or player.Character ~= sequence.character or sequence.humanoid.Health <= 0 then
+		finishSequence(player, sequence, "cancelled", true)
 		return
 	end
 
-	local power = math.clamp(multiplier, 0.3, 3.5)
-	local launchDirection = (sequence.root.CFrame.LookVector + Vector3.new(0, 0.8, 0)).Unit
+	-- Everything below is computed on the server from the server's own tables
+	local timing = Config.TimingMultipliers[zoneName] or Config.TimingMultipliers.Red
+	local batLevel = player:GetAttribute("BatLevel")
+	if typeof(batLevel) ~= "number" then
+		batLevel = 1
+	end
+	local power = Config.GetBatPower(batLevel) * timing
+
+	local look = sequence.root.CFrame.LookVector
+	local flatLook = Vector3.new(look.X, 0, look.Z)
+	flatLook = if flatLook.Magnitude > 0.001 then flatLook.Unit else Vector3.new(0, 0, -1)
+	local angle = math.rad(Config.LAUNCH_ANGLE_DEGREES)
+	local launchDirection = flatLook * math.cos(angle) + Vector3.new(0, math.sin(angle), 0)
+
 	brainRot.Anchored = false
-	brainRot.AssemblyLinearVelocity = launchDirection * (45 * power)
-	brainRot.AssemblyAngularVelocity = Vector3.new(0, 8, 0)
 	pcall(function()
 		brainRot:SetNetworkOwner(nil)
 	end)
+	brainRot.AssemblyLinearVelocity = launchDirection * power
+	brainRot.AssemblyAngularVelocity = Vector3.new(0, 8, 0)
+
+	local raycastParams = RaycastParams.new()
+	raycastParams.FilterType = Enum.RaycastFilterType.Exclude
+	raycastParams.FilterDescendantsInstances = { brainRot, sequence.character }
 
 	local now = os.clock()
-	local flight = {
+	activeFlights[player] = {
 		brainRot = brainRot,
 		startPosition = brainRot.Position,
 		lastPosition = brainRot.Position,
 		startedAt = now,
 		lastMovedAt = now,
 		nextGroundCheck = now,
+		raycastParams = raycastParams,
 		steer = 0,
 		dive = false,
 	}
-	activeFlights[player] = flight
+	local flight = activeFlights[player]
 	finishSequence(player, sequence, reason, false)
 	flightRemote:FireClient(player, "Started", brainRot)
+	print(string.format("[BrainRot] %s launched: zone=%s power=%.1f", player.Name, zoneName, power))
+	return flight
 end
 
 local function startSequence(player: Player)
-	print(string.format("[BrainRot] TriggerBonkSequence received from %s.", player.Name))
 	if activeSequences[player] or activeFlights[player] then
-		print(string.format("[BrainRot] Ignored request from %s: sequence or flight already active.", player.Name))
+		return
+	end
+	local lastEnd = lastFlightEndedAt[player]
+	if lastEnd and os.clock() - lastEnd < Config.COOLDOWN then
 		return
 	end
 
@@ -147,22 +186,15 @@ local function startSequence(player: Player)
 		return
 	end
 	if humanoid.Health <= 0 then
-		warn(string.format("[BrainRot] Cannot start for %s: Humanoid is dead.", player.Name))
 		return
 	end
-
-	local zoneDistance = getBonkZoneDistance(root.Position)
-	if zoneDistance == nil then return end
-	print(string.format("[BrainRot] %s is %.2f studs from BonkZone (limit: %d).", player.Name, zoneDistance, BONK_ZONE_RADIUS))
-	if zoneDistance > BONK_ZONE_RADIUS then
-		print(string.format("[BrainRot] Rejected %s: outside BonkZone launch radius.", player.Name))
+	if not isInBonkZone(root.Position) then
 		return
 	end
 
 	local brainRot = Instance.new("Part")
 	brainRot.Name = "CurrentBrainRot"
 	brainRot.Size = Vector3.new(2, 2, 2)
-	brainRot.Shape = Enum.PartType.Block
 	brainRot.BrickColor = BrickColor.new("Bright yellow")
 	brainRot.Material = Enum.Material.SmoothPlastic
 	brainRot.CanCollide = true
@@ -189,38 +221,49 @@ local function startSequence(player: Player)
 	humanoid.JumpHeight = 0
 	humanoid.AutoRotate = false
 	root.Anchored = true
-	timingRemote:FireClient(player, true, HIT_WINDOW_SECONDS)
-	print(string.format("[BrainRot] Sequence started for %s; timing window is %d seconds.", player.Name, HIT_WINDOW_SECONDS))
+	timingRemote:FireClient(player, true, Config.HIT_WINDOW_SECONDS)
 
-	task.delay(HIT_WINDOW_SECONDS, function()
+	humanoid.Died:Connect(function()
+		finishSequence(player, sequence, "cancelled", true)
+	end)
+
+	task.delay(Config.HIT_WINDOW_SECONDS, function()
 		if activeSequences[player] == sequence then
-			launchBrainRot(player, sequence, 1, "timeout")
+			launchBrainRot(player, sequence, "Red", "timeout")
 		end
 	end)
 end
 
 triggerRemote.OnServerEvent:Connect(startSequence)
 
-hitRemote.OnServerEvent:Connect(function(player: Player, multiplier: any)
+hitRemote.OnServerEvent:Connect(function(player: Player, zone: any)
 	local sequence = activeSequences[player]
-	if not sequence then return end
-	if os.clock() - sequence.startedAt >= HIT_WINDOW_SECONDS then
-		launchBrainRot(player, sequence, 1, "timeout")
+	if not sequence then
 		return
 	end
-	if player.Character ~= sequence.character or sequence.humanoid.Health <= 0 then
-		finishSequence(player, sequence, "cancelled", true)
+	if os.clock() - sequence.startedAt >= Config.HIT_WINDOW_SECONDS then
+		launchBrainRot(player, sequence, "Red", "timeout")
 		return
 	end
-	if typeof(multiplier) ~= "number" then return end
-
-	launchBrainRot(player, sequence, multiplier, "hit")
+	-- the client sends only a zone NAME; anything unknown counts as the weakest zone
+	if typeof(zone) ~= "string" or Config.TimingMultipliers[zone] == nil then
+		zone = "Red"
+	end
+	launchBrainRot(player, sequence, zone, "hit")
 end)
 
 steerRemote.OnServerEvent:Connect(function(player: Player, steer: any, dive: any)
 	local flight = activeFlights[player]
-	if not flight then return end
-	if typeof(steer) == "number" then
+	if not flight then
+		return
+	end
+	local now = os.clock()
+	if lastSteerAt[player] and now - lastSteerAt[player] < 0.03 then
+		return -- rate limit
+	end
+	lastSteerAt[player] = now
+
+	if typeof(steer) == "number" and steer == steer then
 		flight.steer = math.clamp(steer, -1, 1)
 	end
 	if typeof(dive) == "boolean" then
@@ -256,18 +299,15 @@ RunService.Heartbeat:Connect(function(deltaTime)
 
 		if now >= flight.nextGroundCheck then
 			flight.nextGroundCheck = now + 0.1
-			local raycastParams = RaycastParams.new()
-			raycastParams.FilterType = Enum.RaycastFilterType.Exclude
-			raycastParams.FilterDescendantsInstances = { brainRot, player.Character }
 			local groundHit = Workspace:Raycast(
 				brainRot.Position,
 				Vector3.new(0, -(brainRot.Size.Y / 2 + 0.35), 0),
-				raycastParams
+				flight.raycastParams
 			)
 			local flightTime = now - flight.startedAt
 			if (flightTime > 0.4 and groundHit)
 				or (flightTime > 0.8 and now - flight.lastMovedAt > 0.8)
-				or flightTime > 20 then
+				or flightTime > Config.MAX_FLIGHT_SECONDS then
 				completeFlight(player, flight)
 			end
 		end
@@ -286,4 +326,6 @@ Players.PlayerRemoving:Connect(function(player)
 			flight.brainRot:Destroy()
 		end
 	end
+	lastFlightEndedAt[player] = nil
+	lastSteerAt[player] = nil
 end)

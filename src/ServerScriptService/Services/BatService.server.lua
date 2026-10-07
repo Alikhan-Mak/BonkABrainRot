@@ -1,22 +1,20 @@
 local Players = game:GetService("Players")
 local Workspace = game:GetService("Workspace")
 
-local KNOCKDOWN_SECONDS = 5
+local KNOCKDOWN_SECONDS = 3
 local ATTACK_COOLDOWN_SECONDS = 0.65
 local HITBOX_SIZE = Vector3.new(7, 7, 9)
 local HITBOX_FORWARD_OFFSET = 4
-local KNOCKBACK_SPEED = 16
-local UPWARD_SPEED = 5
 
-local boundTools = {}
-local lastAttackAt = {}
-local knockedDown = {}
+local boundTools = setmetatable({}, { __mode = "k" })
+local lastAttackAt = {} -- [Player]
+local knockedDown = setmetatable({}, { __mode = "k" }) -- [character Model] (works for players AND NPCs)
 
 local function isInsideSafeZone(position: Vector3): boolean
 	local zonesFolder = Workspace:FindFirstChild("Zones")
 	local safeZone = zonesFolder and zonesFolder:FindFirstChild("SafeZone")
 	if not safeZone or not safeZone:IsA("BasePart") then
-		return false
+		return true -- no SafeZone in the map: allow attacks
 	end
 
 	local localPosition = safeZone.CFrame:PointToObjectSpace(position)
@@ -26,55 +24,50 @@ local function isInsideSafeZone(position: Vector3): boolean
 		and math.abs(localPosition.Z) <= halfSize.Z
 end
 
-local function findTarget(attacker: Player, character: Model, root: BasePart): (Player?, Model?, Humanoid?, BasePart?)
+local function findTarget(character: Model, root: BasePart): (Model?, Humanoid?, BasePart?)
 	local overlapParams = OverlapParams.new()
 	overlapParams.FilterType = Enum.RaycastFilterType.Exclude
 	overlapParams.FilterDescendantsInstances = { character }
 
 	local hitboxCFrame = root.CFrame * CFrame.new(0, 0, -HITBOX_FORWARD_OFFSET)
 	local hitParts = Workspace:GetPartBoundsInBox(hitboxCFrame, HITBOX_SIZE, overlapParams)
-	local nearestPlayer = nil
-	local nearestCharacter = nil
-	local nearestHumanoid = nil
-	local nearestRoot = nil
+
+	local nearestCharacter, nearestHumanoid, nearestRoot = nil, nil, nil
 	local nearestDistance = math.huge
 
 	for _, hitPart in ipairs(hitParts) do
 		local targetCharacter = hitPart:FindFirstAncestorOfClass("Model")
 		if targetCharacter and targetCharacter ~= character then
-			local targetPlayer = Players:GetPlayerFromCharacter(targetCharacter)
 			local targetHumanoid = targetCharacter:FindFirstChildOfClass("Humanoid")
 			local targetRoot = targetCharacter:FindFirstChild("HumanoidRootPart")
-			if targetPlayer and targetHumanoid and targetRoot and targetHumanoid.Health > 0 then
+			if targetHumanoid and targetRoot and targetRoot:IsA("BasePart") and targetHumanoid.Health > 0 then
 				local distance = (targetRoot.Position - root.Position).Magnitude
 				if distance < nearestDistance then
-					nearestPlayer = targetPlayer
-					nearestCharacter = targetCharacter
-					nearestHumanoid = targetHumanoid
-					nearestRoot = targetRoot
+					nearestCharacter, nearestHumanoid, nearestRoot = targetCharacter, targetHumanoid, targetRoot
 					nearestDistance = distance
 				end
 			end
 		end
 	end
 
-	return nearestPlayer, nearestCharacter, nearestHumanoid, nearestRoot
+	return nearestCharacter, nearestHumanoid, nearestRoot
 end
 
-local function knockDown(targetPlayer: Player, targetHumanoid: Humanoid, targetRoot: BasePart, direction: Vector3)
-	if knockedDown[targetPlayer] or targetHumanoid.Health <= 0 then return end
+local function knockDown(targetCharacter: Model, targetHumanoid: Humanoid, targetRoot: BasePart, direction: Vector3)
+	if knockedDown[targetCharacter] or targetHumanoid.Health <= 0 then
+		return
+	end
 
 	local state = {
-		token = {},
-		humanoid = targetHumanoid,
-		root = targetRoot,
 		walkSpeed = targetHumanoid.WalkSpeed,
 		jumpPower = targetHumanoid.JumpPower,
 		jumpHeight = targetHumanoid.JumpHeight,
 		autoRotate = targetHumanoid.AutoRotate,
 		rootAnchored = targetRoot.Anchored,
 	}
-	knockedDown[targetPlayer] = state
+	knockedDown[targetCharacter] = state
+
+	local knockDirection = if direction.Magnitude > 0 then direction.Unit else Vector3.new(0, 1, 0)
 
 	targetHumanoid.WalkSpeed = 0
 	targetHumanoid.JumpPower = 0
@@ -83,14 +76,14 @@ local function knockDown(targetPlayer: Player, targetHumanoid: Humanoid, targetR
 	targetHumanoid.PlatformStand = true
 	targetHumanoid:ChangeState(Enum.HumanoidStateType.FallingDown)
 	targetRoot.Anchored = false
-	targetRoot:ApplyImpulse(
-		(direction * KNOCKBACK_SPEED + Vector3.new(0, UPWARD_SPEED, 0)) * targetRoot.AssemblyMass
-	)
-	targetRoot.AssemblyAngularVelocity = Vector3.new(direction.Z * 3, 0, -direction.X * 3)
+	targetRoot:ApplyImpulse((knockDirection * 1000 + Vector3.new(0, 500, 0)) * targetRoot.AssemblyMass)
+	targetRoot.AssemblyAngularVelocity = Vector3.new(knockDirection.Z * 3, 0, -knockDirection.X * 3)
 
 	task.delay(KNOCKDOWN_SECONDS, function()
-		if knockedDown[targetPlayer] ~= state then return end
-		knockedDown[targetPlayer] = nil
+		if knockedDown[targetCharacter] ~= state then
+			return
+		end
+		knockedDown[targetCharacter] = nil
 
 		if targetHumanoid.Parent and targetHumanoid.Health > 0 then
 			targetHumanoid.WalkSpeed = state.walkSpeed
@@ -112,32 +105,48 @@ local function onToolActivated(tool: Tool)
 	local attacker = character and Players:GetPlayerFromCharacter(character)
 	local humanoid = character and character:FindFirstChildOfClass("Humanoid")
 	local root = character and character:FindFirstChild("HumanoidRootPart")
-	if not (attacker and humanoid and root) or humanoid.Health <= 0 then return end
-	if not isInsideSafeZone(root.Position) then return end
-
-	local now = os.clock()
-	if lastAttackAt[attacker] and now - lastAttackAt[attacker] < ATTACK_COOLDOWN_SECONDS then return end
-	lastAttackAt[attacker] = now
-
-	local targetPlayer, _, targetHumanoid, targetRoot = findTarget(attacker, character, root)
-	if not (targetPlayer and targetHumanoid and targetRoot) then return end
-
-	local direction = targetRoot.Position - root.Position
-	if direction.Magnitude <= 0.001 then
-		direction = root.CFrame.LookVector
-	else
-		direction = direction.Unit
+	if not (attacker and humanoid and root) or humanoid.Health <= 0 or not root:IsA("BasePart") then
+		return
+	end
+	if not isInsideSafeZone(root.Position) then
+		return
 	end
 
-	knockDown(targetPlayer, targetHumanoid, targetRoot, direction)
+	local now = os.clock()
+	if lastAttackAt[attacker] and now - lastAttackAt[attacker] < ATTACK_COOLDOWN_SECONDS then
+		return
+	end
+	lastAttackAt[attacker] = now
+
+	local targetCharacter, targetHumanoid, targetRoot = findTarget(character, root)
+	if not (targetCharacter and targetHumanoid and targetRoot) then
+		return
+	end
+
+	local direction = targetRoot.Position - root.Position
+	direction = if direction.Magnitude <= 0.001 then root.CFrame.LookVector else direction.Unit
+
+	knockDown(targetCharacter, targetHumanoid, targetRoot, direction)
 end
 
 local function bindTool(tool: Instance)
-	if not tool:IsA("Tool") or boundTools[tool] then return end
+	if not tool:IsA("Tool") or boundTools[tool] then
+		return
+	end
 	boundTools[tool] = true
 	tool.Activated:Connect(function()
 		onToolActivated(tool)
 	end)
+end
+
+local function bindBackpack(backpack: Instance)
+	if not backpack:IsA("Backpack") then
+		return
+	end
+	for _, child in ipairs(backpack:GetChildren()) do
+		bindTool(child)
+	end
+	backpack.ChildAdded:Connect(bindTool)
 end
 
 local function setupPlayer(player: Player)
@@ -148,16 +157,17 @@ local function setupPlayer(player: Player)
 		character.ChildAdded:Connect(bindTool)
 	end
 
+	-- the Backpack is re-created on every respawn, so watch for new ones
+	player.ChildAdded:Connect(bindBackpack)
+	local backpack = player:FindFirstChildOfClass("Backpack")
+	if backpack then
+		bindBackpack(backpack)
+	end
+
 	if player.Character then
 		setupCharacter(player.Character)
 	end
 	player.CharacterAdded:Connect(setupCharacter)
-
-	local backpack = player:WaitForChild("Backpack")
-	for _, child in ipairs(backpack:GetChildren()) do
-		bindTool(child)
-	end
-	backpack.ChildAdded:Connect(bindTool)
 end
 
 for _, player in ipairs(Players:GetPlayers()) do
@@ -167,5 +177,4 @@ Players.PlayerAdded:Connect(setupPlayer)
 
 Players.PlayerRemoving:Connect(function(player)
 	lastAttackAt[player] = nil
-	knockedDown[player] = nil
 end)
